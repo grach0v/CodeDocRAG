@@ -190,6 +190,7 @@ class FixedTokenChunker(TextSplitter):
         self,
         encoding_name: str = "cl100k_base",
         model_name: Optional[str] = None,
+        tokenizer: Optional[Any] = None,
         chunk_size: int = 4000,
         chunk_overlap: int = 200,
         allowed_special: Union[Literal["all"], AbstractSet[str]] = set(),
@@ -209,8 +210,13 @@ class FixedTokenChunker(TextSplitter):
 
         if model_name is not None:
             enc = tiktoken.encoding_for_model(model_name)
-        else:
+        elif encoding_name is not None:
             enc = tiktoken.get_encoding(encoding_name)
+        elif tokenizer is not None:
+            enc = tokenizer
+        else:
+            raise ValueError("Must provide either model_name or encoding_name or tokenizer.")
+
         self._tokenizer = enc
         self._allowed_special = allowed_special
         self._disallowed_special = disallowed_special
