@@ -1,4 +1,4 @@
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Any
 import pandas as pd 
 import json 
 from fixed_token_chunker import FixedTokenChunker
@@ -7,9 +7,20 @@ from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 import argparse
+import gc
 
 def get_ranges(text: str, chunks: List[str], chunk_indices: List[int]) -> List[Tuple[int, int]]:
-    """Return list of (start, end) ranges for given chunk indices found in text."""
+    """
+    Return list of (start, end) ranges for given chunk indices found in text.
+    
+    Parameters:
+        text (str): The source text.
+        chunks (List[str]): List of text chunks.
+        chunk_indices (List[int]): Indices of chunks in the list.
+    
+    Returns:
+        List[Tuple[int, int]]: List of (start, end) ranges.
+    """
     ranges: List[Tuple[int, int]] = []
     for index in chunk_indices:
         start = text.find(chunks[index])
@@ -20,11 +31,27 @@ def get_ranges(text: str, chunks: List[str], chunk_indices: List[int]) -> List[T
     return ranges
 
 def sum_of_ranges(ranges: List[Tuple[int, int]]) -> int:
-    """Return the sum of the lengths of the given intervals."""
+    """
+    Calculate the total length of all intervals.
+    
+    Parameters:
+        ranges (List[Tuple[int, int]]): List of (start, end) intervals.
+    
+    Returns:
+        int: Sum of interval lengths.
+    """
     return sum(end - start for start, end in ranges)
 
 def merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    """Merge overlapping intervals into consolidated intervals."""
+    """
+    Merge overlapping intervals into consolidated intervals.
+    
+    Parameters:
+        intervals (List[Tuple[int, int]]): List of (start, end) intervals.
+    
+    Returns:
+        List[Tuple[int, int]]: Merged intervals.
+    """
     if not intervals:
         return []
     intervals.sort(key=lambda x: x[0])
@@ -39,7 +66,16 @@ def merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     return merged
 
 def intersect_intervals(retrieved: List[Tuple[int, int]], targets: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    """Return intersections between retrieved and target intervals."""
+    """
+    Compute the intersections between retrieved and target intervals.
+    
+    Parameters:
+        retrieved (List[Tuple[int, int]]): List of retrieved intervals.
+        targets (List[Tuple[int, int]]): List of target intervals.
+    
+    Returns:
+        List[Tuple[int, int]]: List of intersection intervals.
+    """
     retrieved.sort(key=lambda x: x[0])
     targets.sort(key=lambda x: x[0])
     i, j = 0, 0
@@ -57,29 +93,19 @@ def intersect_intervals(retrieved: List[Tuple[int, int]], targets: List[Tuple[in
             j += 1
     return intersections
 
-def run_experiment(questions_path: str, text_path: str, chunk_size: int = 100, 
-                   chunk_overlap: int = 20, num_retrieved_chunks: int = 1, 
-                   model_name: str = 'sentence-transformers/all-MiniLM-L6-v2',
-                   threshold: float = 0.0) -> List[Dict[str, float]]:
+def create_chunks(text: str, chunk_size: int, chunk_overlap: int, model_name: str) -> Tuple[List[str], Any]:
     """
-    Run evaluation experiment on the provided corpus and question set.
-
-    Parameters:
-        questions_path (str): Path to CSV file containing questions.
-        text_path (str): Path to text file containing corpus text.
-        chunk_size (int): Chunk size for splitting text.
-        chunk_overlap (int): Overlap between successive chunks.
-        num_retrieved_chunks (int): Number of closest chunks to retrieve.
-        model_name (str): HuggingFace model name used for embeddings.
-        threshold (float): Minimal cosine similarity value to consider a chunk.
-
+    Create text chunks using FixedTokenChunker.
+    
+    Args:
+        text (str): The source text.
+        chunk_size (int): The desired size of each chunk.
+        chunk_overlap (int): The number of overlapping tokens between chunks.
+        model_name (str): The HuggingFace model name used for tokenization.
+    
     Returns:
-        List[Dict[str, float]]: List of evaluation metrics (IoU, Precision, Recall, F1) per question.
+        Tuple[List[str], Any]: A tuple of the list of text chunks and the tokenizer.
     """
-    questions_df = pd.read_csv(questions_path)
-    with open(text_path, encoding="utf-8") as f:
-        text = f.read()
-
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     chunker = FixedTokenChunker(
         tokenizer=tokenizer,
@@ -87,14 +113,41 @@ def run_experiment(questions_path: str, text_path: str, chunk_size: int = 100,
         chunk_overlap=chunk_overlap,
     )
     chunks = chunker.split_text(text)
+    return chunks, tokenizer
 
-    model = SentenceTransformer(model_name)
-    text_embeddings = model.encode(chunks)
-    question_embeddings = model.encode(questions_df['question'].tolist())
-
-    similarities = cosine_similarity(question_embeddings, text_embeddings)
+def create_embeddings(chunks: List[str], questions: List[str], model_name: str, device: str) -> Tuple[Any, np.ndarray, np.ndarray]:
+    """
+    Compute embeddings for text chunks and questions using SentenceTransformer.
     
-    # Retrieve indices with similarity >= threshold per query
+    Args:
+    
+        chunks (List[str]): List of text chunks.
+        questions (List[str]): List of questions.
+        model_name (str): The SentenceTransformer model name.
+        device (str): Device on which to run the model.
+    
+    Returns:
+        Tuple[Any, np.ndarray, np.ndarray]: The model instance, text embeddings, and question embeddings.
+    """
+    model = SentenceTransformer(model_name, device=device)
+    text_embeddings = model.encode(chunks)
+    question_embeddings = model.encode(questions)
+    return text_embeddings, question_embeddings
+
+def retrieve_chunks(question_embeddings: np.ndarray, text_embeddings: np.ndarray, threshold: float, num_retrieved_chunks: int) -> List[np.ndarray]:
+    """
+    Calculate cosine similarities between question and text embeddings and retrieve indices exceeding a threshold.
+
+    Args:
+        question_embeddings (np.ndarray): Embeddings for questions.
+        text_embeddings (np.ndarray): Embeddings for text chunks.
+        threshold (float): Minimum similarity score to consider.
+        num_retrieved_chunks (int): Number of top chunks to retrieve for each query.
+
+    Returns:
+        List[np.ndarray]: A list containing numpy arrays of retrieved chunk indices for each question.
+    """
+    similarities = cosine_similarity(question_embeddings, text_embeddings)
     retrieved_indices = []
     for sim in similarities:
         valid_idx = np.where(sim >= threshold)[0]
@@ -103,21 +156,16 @@ def run_experiment(questions_path: str, text_path: str, chunk_size: int = 100,
             retrieved_indices.append(sorted_valid[:num_retrieved_chunks])
         else:
             retrieved_indices.append(np.array([], dtype=int))
-    
-    closest_texts_indices = retrieved_indices
+    return retrieved_indices
 
-    retrieved_intervals = [
-        get_ranges(text, chunks, list(indices)) 
-        for indices in closest_texts_indices
-    ]
+def measure_metrics(text: str, chunks: List[str], retrieved_indices: List[np.ndarray], questions_df: pd.DataFrame) -> List[Dict[str, float]]:
+    # Prepare intervals and compute evaluation metrics.
+    retrieved_intervals = [merge_intervals(get_ranges(text, chunks, list(indices))) for indices in retrieved_indices]
     target_intervals = [
-        [(ref['start_index'], ref['end_index']) for ref in json.loads(references)]
+        merge_intervals([(ref['start_index'], ref['end_index']) for ref in json.loads(references)])
         for references in questions_df['references']
     ]
-    retrieved_intervals = [merge_intervals(intervals) for intervals in retrieved_intervals]
-    target_intervals = [merge_intervals(intervals) for intervals in target_intervals]
-
-    results: List[Dict[str, float]] = []
+    results = []
     for retrieved, target in zip(retrieved_intervals, target_intervals):
         intersections = intersect_intervals(retrieved.copy(), target.copy())
         total_intersection = sum_of_ranges(intersections)
@@ -135,6 +183,48 @@ def run_experiment(questions_path: str, text_path: str, chunk_size: int = 100,
         })
     return results
 
+def run_experiment(questions_path: str, text_path: str, chunk_size: int = 100, 
+                   chunk_overlap: int = 20, num_retrieved_chunks: int = 1, 
+                   model_name: str = 'sentence-transformers/all-MiniLM-L6-v2',
+                   threshold: float = 0.0,
+                   device: str = 'cpu') -> List[Dict[str, float]]:
+    """
+    Execute the evaluation experiment by performing chunking, embedding, retrieval, and metric calculations.
+    
+    Args:
+        questions_path (str): Path to the CSV file containing questions.
+        text_path (str): Path to the text file.
+        chunk_size (int, optional): Size of each text chunk. Defaults to 100.
+        chunk_overlap (int, optional): Number of overlapping tokens between chunks. Defaults to 20.
+        num_retrieved_chunks (int, optional): Number of closest chunks to retrieve per query. Defaults to 1.
+        model_name (str, optional): HuggingFace model name used for processing. Defaults to 'sentence-transformers/all-MiniLM-L6-v2'.
+        threshold (float, optional): Minimum cosine similarity threshold. Defaults to 0.0.
+        device (str, optional): Device on which the model is run. Defaults to 'cpu'.
+        
+    Returns:
+        List[Dict[str, float]]: A list of metric dictionaries for each evaluation.
+    """
+    # Load data
+    questions_df = pd.read_csv(questions_path)
+    with open(text_path, encoding="utf-8") as f:
+        text = f.read()
+
+    # Create text chunks
+    chunks, tokenizer = create_chunks(text, chunk_size, chunk_overlap, model_name)
+    
+    # Compute embeddings for chunks and questions
+    text_embeddings, question_embeddings = create_embeddings(chunks, questions_df['question'].tolist(), model_name, device)
+    # Retrieve best chunk indices per question (cosine similarity computed inside retrieve_chunks)
+    retrieved_indices = retrieve_chunks(question_embeddings, text_embeddings, threshold, num_retrieved_chunks)
+    
+    # Measure evaluation metrics
+    results = measure_metrics(text, chunks, retrieved_indices, questions_df)
+    
+    # Free heavy resources
+    del tokenizer, model, text_embeddings, question_embeddings
+    gc.collect()
+    return results
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Run evaluation experiment')
     parser.add_argument('--questions', default='../data/questions_df.csv', help='Path to questions CSV')
@@ -144,6 +234,7 @@ if __name__ == '__main__':
     parser.add_argument('--num_retrieved_chunks', type=int, default=1, help='Number of closest chunks to retrieve')
     parser.add_argument('--model_name', type=str, default='sentence-transformers/all-MiniLM-L6-v2', help='HuggingFace model name')
     parser.add_argument('--threshold', type=float, default=0.0, help='Minimum cosine similarity threshold')
+    parser.add_argument('--device', type=str, default='cpu', help='Device to run model on')
     args = parser.parse_args()
 
     metrics = run_experiment(
@@ -153,7 +244,8 @@ if __name__ == '__main__':
         chunk_overlap=args.chunk_overlap,
         num_retrieved_chunks=args.num_retrieved_chunks,
         model_name=args.model_name,
-        threshold=args.threshold
+        threshold=args.threshold,
+        device=args.device
     )
     
     for m in metrics:
